@@ -25,7 +25,10 @@ TARGET_APPS = list(APPLIANCE_MAP.values())
 
 @st.cache_resource
 def load_assets():
-    df = pd.read_csv("CLEAN_House4.csv")
+    base_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    csv_path = os.path.join(base_dir, "CLEAN_House4.csv")
+    df = pd.read_csv(csv_path)
     df['Time'] = pd.to_datetime(df['Time'])
     df = df.rename(columns=APPLIANCE_MAP)
     start_idx_list = df[df['Time'].dt.strftime('%H:%M:%S') == '00:00:00'].index
@@ -33,10 +36,10 @@ def load_assets():
     
     loaded_models = {}
     for app in TARGET_APPS:
-        model_path = f"{app}.joblib"
+        model_path = os.path.join(base_dir, f"{app}.joblib")
         if os.path.exists(model_path):
             try: loaded_models[app] = joblib.load(model_path)
-            except: pass
+            except Exception as e: print(f"Błąd modelu {app}: {e}")
     return df, loaded_models, first_midnight
 
 df_raw, models_dict, midnight_idx = load_assets()
@@ -53,13 +56,19 @@ if 'consumption' not in st.session_state:
     st.session_state.consumption = {app: 0.0 for app in TARGET_APPS}
 if 'total_agg_kWh' not in st.session_state: st.session_state.total_agg_kWh = 0.0
 
-# --- SIDEBAR USTAWIENIA ---
+# ZMIENNE DO PLANU DNIA I PODSUMOWAŃ
+if 'daily_routine' not in st.session_state: st.session_state.daily_routine = []
+if 'yesterday_routine' not in st.session_state: st.session_state.yesterday_routine = []
+if 'yesterday_cost' not in st.session_state: st.session_state.yesterday_cost = 0.0
+
+# --- SIDEBAR (USTAWIENIA) ---
 st.sidebar.header("⚙️ Ustawienia")
 selected_apps = st.sidebar.multiselect("Monitoring Wykresu", TARGET_APPS, default=['Washing_Machine', 'TV', 'Computer'])
 
 st.sidebar.divider()
 st.sidebar.subheader("🌱 Cele Energetyczne")
 daily_limit = st.sidebar.number_input("Limit dzienny (kWh)", min_value=1.0, max_value=50.0, value=15.0)
+energy_price = st.sidebar.number_input("Cena (PLN/kWh)", value=0.90)
 
 st.sidebar.divider()
 speed_factor = st.sidebar.slider("Prędkość symulacji", 1.0, 100.0, 10.0, 1.0)
@@ -71,8 +80,11 @@ if col_run.button("▶ START"): st.session_state.running = True
 if col_stop.button("⏹ STOP"): st.session_state.running = False
 
 if st.sidebar.button("🧹 Resetuj system"):
-    for key in ['activity_logs', 'history']: st.session_state[key] = [] if key=='activity_logs' else pd.DataFrame()
+    st.session_state.activity_logs = []
+    st.session_state.history = pd.DataFrame()
     st.session_state.consumption = {app: 0.0 for app in TARGET_APPS}
+    st.session_state.daily_routine = []
+    st.session_state.yesterday_routine = []
     st.session_state.total_agg_kWh = 0.0
     st.session_state.current_idx = midnight_idx
     st.session_state.last_notified_day = None
@@ -80,7 +92,7 @@ if st.sidebar.button("🧹 Resetuj system"):
     st.rerun()
 
 # --- LAYOUT GŁÓWNY ---
-tab_monitor, tab_stats, tab_logs = st.tabs(["📊 Live Dashboard", "📈 Analiza Zużycia", "📜 Historia"])
+tab_monitor, tab_stats, tab_logs = st.tabs(["📊 Live Dashboard", "📈 Analiza Zużycia & Rutyna", "📜 Historia"])
 
 with tab_monitor:
     c1, c2 = st.columns([4, 1])
@@ -94,14 +106,17 @@ with tab_monitor:
     status_area = st.empty()
 
 with tab_stats:
-    st.subheader("Statystyki Behawioralne")
-    col_pie, col_rank = st.columns(2)
+    st.subheader("Profil Dnia Użytkownika")
+    col_routine, col_pie = st.columns([1, 1])
+    routine_area = col_routine.empty()
     pie_area = col_pie.empty()
-    rank_area = col_rank.empty()
+    st.divider()
+    rank_area = st.empty()
 
 with tab_logs:
     log_display = st.container()
 
+# --- SYMULACJA ---
 if st.session_state.running:
     idx = st.session_state.current_idx
     if idx < len(df_raw):
@@ -112,26 +127,43 @@ if st.session_state.running:
         
         last_row = rows.iloc[-1]
         t = last_row['Time']
+        current_date = t.date()
+        
+        # Inicjalizacja dnia (uruchamia się tylko raz na początku)
+        if st.session_state.last_notified_day is None:
+            st.session_state.last_notified_day = current_date
         
         new_kWh = (rows['Aggregate'].sum() * 8) / 3600000
         st.session_state.total_agg_kWh += new_kWh
 
-        # main plot
+        # 1. DETEKCJA ZMIANY DNIA I RESET
+        if current_date != st.session_state.last_notified_day:
+            # Zapisujemy podsumowanie minionego dnia
+            st.session_state.yesterday_routine = list(st.session_state.daily_routine)
+            st.session_state.yesterday_cost = st.session_state.total_agg_kWh * energy_price
+            
+            # Tworzymy log
+            st.session_state.activity_logs.insert(0, f"📅 ZAKOŃCZONO DZIEŃ. Koszt: {st.session_state.yesterday_cost:.2f} PLN")
+            st.session_state.activity_logs.insert(0, f"📅 SYSTEM: Rozpoczęto nowy dzień {current_date}")
+            
+            # Resetujemy liczniki i listy na nowy dzień
+            st.session_state.daily_routine = []
+            st.session_state.total_agg_kWh = 0.0
+            st.session_state.consumption = {app: 0.0 for app in TARGET_APPS}
+            
+            # Aktualizujemy śledzenie dnia
+            st.session_state.last_notified_day = current_date
+
+        # 2. WYKRES
         with chart_area.container():
             plot_df = df_win.copy().set_index('Time')
             plot_df = plot_df.loc[t - pd.Timedelta(minutes=20) : t]
             st.line_chart(plot_df[['Aggregate'] + [c for c in selected_apps if c in plot_df.columns]], height=350)
-            
-            if any(rows['Time'].dt.strftime('%H:%M:%S') == '00:00:00'):
-                if st.session_state.last_notified_day != t.date():
-                    st.session_state.last_notified_day = t.date()
-                    st.session_state.activity_logs.insert(0, f"📅 SYSTEM: Rozpoczęto dzień {t.date()}")
 
-        # Ciężkie urządzenia
         active_heavy = 0
         heavy_list = ['Washing_Machine', 'Tumble_Dryer', 'Electric_Heater', 'Dishwasher']
 
-        # Modele
+        # 3. PREDYKCJA I KAFELKI
         with status_area.container():
             if len(df_win) >= 37:
                 cols_ui = st.columns(len(TARGET_APPS))
@@ -164,8 +196,18 @@ if st.session_state.running:
                         st.session_state.consumption[app_name] += (p_est.get(app_name, 200) * 8 * step_size) / 3600000
 
                     state = st.session_state.app_states[app_name]
+                    
+                    # LOGIKA WYKRYWANIA WŁĄCZENIA
                     if is_active and not state['active']:
                         st.session_state.app_states[app_name] = {'active': True, 'start_t': t}
+                        
+                        # Dodajemy do listy zdarzeń (ignorując lodówki)
+                        if app_name not in ['Fridge_Freezer', 'Chest_Freezer', 'Upright_Freezer']:
+                            st.session_state.daily_routine.append({
+                                'time': t.strftime('%H:%M'),
+                                'app': app_name
+                            })
+                            
                     elif not is_active and state['active']:
                         dur = (t - state['start_t']).total_seconds()
                         if dur > 10:
@@ -186,9 +228,9 @@ if st.session_state.running:
                         <b style="font-size:12px;">{"ACTIVE" if is_active else "OFF"}</b></div>
                     """, unsafe_allow_html=True)
             else:
-                st.info(f"Synchronizacja bufora danych... {len(df_win)}/37")
+                st.info(f"Trwa inicjalizacja modeli AI... {len(df_win)}/37")
 
-        # 3. ECO-INDICATOR
+        # 4. ECO-INDICATOR REFRESH
         with eco_indicator:
             if active_heavy >= 3: st.markdown("<h2 style='color: #d62728; text-align:center;'>🔴 Low</h2>", unsafe_allow_html=True)
             elif active_heavy >= 1: st.markdown("<h2 style='color: #ff7f0e; text-align:center;'>🟠 Med</h2>", unsafe_allow_html=True)
@@ -197,14 +239,35 @@ if st.session_state.running:
         with progress_area:
             prog = min(st.session_state.total_agg_kWh / daily_limit, 1.0)
             st.progress(prog)
-            st.write(f"Limit: {st.session_state.total_agg_kWh:.2f} / {daily_limit} kWh")
+            st.write(f"Zużyto dziś: {st.session_state.total_agg_kWh:.2f} / {daily_limit} kWh")
 
-        # LOGI
+        # 5. STATYSTYKI I RUTYNA W TABIE
+        with routine_area:
+            # Pokaż podsumowanie z wczoraj (jeśli symulacja przeszła przez północ)
+            if st.session_state.yesterday_routine or st.session_state.yesterday_cost > 0:
+                with st.expander(f"📁 Zobacz podsumowanie wczorajszego dnia (Koszt: {st.session_state.yesterday_cost:.2f} PLN)"):
+                    if not st.session_state.yesterday_routine:
+                        st.write("Brak aktywności człowieka.")
+                    else:
+                        for item in st.session_state.yesterday_routine:
+                            icon = next((v['icon'] for k, v in APPLIANCE_INFO.items() if v['name'] == item['app']), '🔌')
+                            st.markdown(f"**{item['time']}** — {icon} Uruchomiono: {item['app'].replace('_', ' ')}")
+            
+            # Pokaż aktualny plan dnia (lista rośnie z czasem)
+            st.write(f"**🕰️ Aktualny Plan Dnia ({st.session_state.last_notified_day})**")
+            if st.session_state.daily_routine:
+                for item in st.session_state.daily_routine:
+                    icon = next((v['icon'] for k, v in APPLIANCE_INFO.items() if v['name'] == item['app']), '🔌')
+                    st.markdown(f"**{item['time']}** — {icon} Uruchomiono: {item['app'].replace('_', ' ')}")
+            else:
+                st.info("Czekam na pierwsze aktywności człowieka w tym dniu... (ignoruję lodówki)")
+
         stats_data = [{'Urządzenie': k.replace('_',' '), 'kWh': v} 
                       for k, v in st.session_state.consumption.items() if v > 0]
         if stats_data:
             df_stats = pd.DataFrame(stats_data)
             with pie_area:
+                st.write("**Struktura dzisiejszego zużycia**")
                 st.vega_lite_chart(df_stats, {
                     'mark': {'type': 'arc', 'innerRadius': 40},
                     'encoding': {'theta': {'field': 'kWh', 'type': 'quantitative'}, 'color': {'field': 'Urządzenie', 'type': 'nominal'}}
