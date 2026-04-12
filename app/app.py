@@ -44,9 +44,23 @@ def load_assets():
 
 df_raw, models_dict, midnight_idx = load_assets()
 
+# przygotowanie danych do heatmapy
+@st.cache_data
+def get_shifted_start_idx(df, start_idx, days_to_skip=30):
+    """Oblicza indeks w dataframe przesunięty o określoną liczbę dni do przodu."""
+    start_time = df.iloc[start_idx]['Time']
+    end_time = start_time + pd.Timedelta(days=days_to_skip)
+    future_idx_list = df[df['Time'] >= end_time].index
+    return future_idx_list[0] if len(future_idx_list) > 0 else start_idx
+
+# Obliczamy indeks startowy dla symulacji (30 dni do przodu od oryginalnego midnight_idx)
+shifted_midnight_idx = get_shifted_start_idx(df_raw, midnight_idx, days_to_skip=30)
+
 # --- STAN SESJI ---
 if 'history' not in st.session_state: st.session_state.history = pd.DataFrame()
-if 'current_idx' not in st.session_state: st.session_state.current_idx = midnight_idx
+# Symulacja zawsze startuje z 30-dniowym wyprzedzeniem
+if 'current_idx' not in st.session_state: 
+    st.session_state.current_idx = shifted_midnight_idx
 if 'running' not in st.session_state: st.session_state.running = False
 if 'activity_logs' not in st.session_state: st.session_state.activity_logs = []
 if 'last_notified_day' not in st.session_state: st.session_state.last_notified_day = None
@@ -86,13 +100,13 @@ if st.sidebar.button("🧹 Resetuj system"):
     st.session_state.daily_routine = []
     st.session_state.yesterday_routine = []
     st.session_state.total_agg_kWh = 0.0
-    st.session_state.current_idx = midnight_idx
+    st.session_state.current_idx = shifted_midnight_idx
     st.session_state.last_notified_day = None
     st.session_state.running = False
     st.rerun()
 
 # --- LAYOUT GŁÓWNY ---
-tab_monitor, tab_stats, tab_logs = st.tabs(["📊 Live Dashboard", "📈 Analiza Zużycia & Rutyna", "📜 Historia"])
+tab_monitor, tab_stats, tab_logs, tab_heatmap = st.tabs(["📊 Live Dashboard", "📈 Analiza Zużycia & Rutyna", "📜 Historia", "🔥 Analiza Aktywności"])
 
 with tab_monitor:
     c1, c2 = st.columns([4, 1])
@@ -115,6 +129,104 @@ with tab_stats:
 
 with tab_logs:
     log_display = st.container()
+
+with tab_heatmap:
+    st.subheader("🔥 Aktywności Urządzeń")
+    st.markdown("<p style='color: #888;'>Wykres przedstawia dane o zachowaniach domowników. Jaśniejszy kolor oznacza wyższe prawdopodobieństwo uruchomienia o danej porze.</p>", unsafe_allow_html=True)
+    
+    # KLUCZOWY MOMENT: Wycinamy dane od oryginalnego początku historii (midnight_idx) 
+    # aż do aktualnego momentu w symulacji (current_idx).
+    # Przy starcie aplikacji jest to dokładnie 30 dni danych. Z każdym krokiem ta baza rośnie.
+    current_slice = df_raw.iloc[midnight_idx : st.session_state.current_idx]
+    
+    if not current_slice.empty:
+        hours = current_slice['Time'].dt.hour
+        heatmap_records = []
+        
+        # Agregacja za pomocą Pandas
+        for app in TARGET_APPS:
+            if app in current_slice.columns:
+                active_mask = current_slice[app] > 10.0 # Zakładamy próg aktywności > 10W
+                hourly_activity = active_mask.groupby(hours).mean().reset_index()
+                
+                # Wyciągamy ikonę z Twojego słownika APPLIANCE_INFO (lub dajemy domyślną wtyczkę, jeśli nie ma)
+                icon = next((v['icon'] for k, v in APPLIANCE_INFO.items() if v['name'] == app), '🔌')
+                display_name = f"{app.replace('_', ' ')} {icon}"
+                
+                for _, row in hourly_activity.iterrows():
+                    heatmap_records.append({
+                        'Urządzenie': display_name,
+                        'Godzina': f"{int(row['Time']):02d}:00",
+                        'Aktywność': row[app]
+                    })
+        
+        df_heatmap_live = pd.DataFrame(heatmap_records)
+        
+        if not df_heatmap_live.empty:
+            st.vega_lite_chart(df_heatmap_live, {
+                'height': {'step': 40}, # Wysokość każdego wiersza
+                'mark': {
+                    'type': 'rect',
+                    'cornerRadius': 6,          
+                    'stroke': '#1e1e1e',        
+                    'strokeWidth': 2            
+                },
+                'encoding': {
+                    'x': {
+                        'field': 'Godzina', 
+                        'type': 'ordinal', 
+                        'title': None,          
+                        'axis': {
+                            'labelAngle': -45,  
+                            'labelColor': '#aaaaaa',
+                            'labelFontSize': 11,
+                            'domain': False,    
+                            'ticks': False      
+                        }
+                    },
+                    'y': {
+                        'field': 'Urządzenie', 
+                        'type': 'nominal', 
+                        'title': None,          
+                        'axis': {
+                            'labelColor': '#dddddd',
+                            'labelFontSize': 13,
+                            'labelFontWeight': 'bold',
+                            'domain': False,
+                            'ticks': False, 
+                            'labelLimit': 500,
+                            'labelOverlap': False # Wymusza pokazanie wszystkich etykiet
+                        }
+                    },
+                    'color': {
+                        'field': 'Aktywność', 
+                        'type': 'quantitative',
+                        'scale': {'scheme': 'inferno'}, 
+                        'legend': {
+                            'title': 'Częstotliwość użycia',
+                            'titleColor': '#aaaaaa',
+                            'labelColor': '#aaaaaa',
+                            'orient': 'bottom', 
+                            'gradientLength': 400, 
+                            'gradientThickness': 10
+                        }
+                    },
+                    'tooltip': [
+                        {'field': 'Urządzenie', 'type': 'nominal', 'title': 'Urządzenie'},
+                        {'field': 'Godzina', 'type': 'ordinal', 'title': '🕒 Godzina'},
+                        {'field': 'Aktywność', 'type': 'quantitative', 'format': '.1%', 'title': '⚡ Aktywność'}
+                    ]
+                },
+                'config': {
+                    'view': {'stroke': 'transparent'}, 
+                    'axis': {'grid': False},           
+                    'background': 'transparent'        
+                }
+            }, use_container_width=True)
+        else:
+            st.warning("Brak wystarczających danych do agregacji.")
+    else:
+        st.info("Trwa ładowanie danych historycznych...")
 
 # --- SYMULACJA ---
 if st.session_state.running:
